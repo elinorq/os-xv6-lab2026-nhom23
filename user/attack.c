@@ -112,7 +112,10 @@ main(int argc, char *argv[])
     // qua nhiều đợt thử độc lập thay vì lặp free/realloc cùng kích thước
     // ngay lập tức).
     if (total_found == 0) {
-      sbrk(-(scanned));
+      if (sbrk(-(scanned)) == (char*)-1) {
+        fprintf(2, "attack: sbrk failed\n");
+        exit(1);
+      }
     }
   }
 
