@@ -15,6 +15,13 @@
 
 #define MAXARGS 10
 
+#define HISTORY_SIZE 10
+#define HISTORY_LINE_SIZE 100
+
+static char cmd_history[HISTORY_SIZE][HISTORY_LINE_SIZE];
+static int history_count = 0;
+static int history_first = 1;
+
 struct cmd {
   int type;
 };
@@ -259,6 +266,33 @@ complete(char *buf, int *len, int capacity)
   write(2, buf, *len);
 }
 
+// Replace the displayed input line, keeping the prompt intact.
+static void
+replace_input(char *buf, int *len, int capacity, char *text)
+{
+  int n = 0;
+
+  // History entries include a newline; do not copy it into the editor.
+  while (text[n] != '\0' &&
+         text[n] != '\n' &&
+         text[n] != '\r' &&
+         n < capacity - 2)
+    n++;
+
+  // Erase the old input from the screen.
+  while (*len > 0) {
+    write(2, "\b \b", 3);
+    (*len)--;
+  }
+
+  // Install and display the replacement.
+  memmove(buf, text, n);
+  buf[n] = '\0';
+  *len = n;
+
+  write(2, buf, n);
+}
+
 // Read and edit a line from the console.
 // Reserve space for a trailing newline and a terminating '\0'.
 int
@@ -266,17 +300,23 @@ readconsoleline(char *buf, int nbuf)
 {
   int len = 0;
   int cc;
+  int escape = 0;
+  int history_pos = history_count;
+  char draft[HISTORY_LINE_SIZE];
   char c;
 
   if (nbuf < 2)
     return -1;
 
   buf[0] = '\0';
+  draft[0] = '\0';
 
   if (consolemode(1) < 0) {
     fprintf(2, "sh: cannot enable console input mode\n");
     return -1;
   }
+
+  write(2, "$ ", 2);
 
   for (;;) {
     cc = read(0, &c, 1);
@@ -286,14 +326,66 @@ readconsoleline(char *buf, int nbuf)
       return -1;
     }
 
+    // ESC was received. Expect '[' or 'O'.
+    if (escape == 1) {
+      escape = 0;
+
+      if (c == '[' || c == 'O') {
+        escape = 2;
+        continue;
+      }
+
+      // Otherwise, process this byte normally below.
+    }
+
+    // Handle the rest of an escape sequence.
+    if (escape == 2) {
+      // Skip optional numeric parameters in terminal sequences.
+      if ((c >= '0' && c <= '9') || c == ';')
+        continue;
+
+      escape = 0;
+
+      if (c == 'A') {
+        // Up: move toward older commands.
+        if (history_pos > 0) {
+          if (history_pos == history_count)
+            strcpy(draft, buf);
+
+          history_pos--;
+          replace_input(buf, &len, nbuf,
+                        cmd_history[history_pos]);
+        }
+      } else if (c == 'B') {
+        // Down: move toward newer commands, then restore the draft.
+        if (history_pos < history_count) {
+          history_pos++;
+
+          if (history_pos == history_count)
+            replace_input(buf, &len, nbuf, draft);
+          else
+            replace_input(buf, &len, nbuf,
+                          cmd_history[history_pos]);
+        }
+      }
+
+      // Ignore other escape sequences in this basic editor.
+      continue;
+    }
+
+    // Start an escape sequence.
+    if (c == 27) {
+      escape = 1;
+      continue;
+    }
+
     // Enter: finish the line.
     if (c == '\n' || c == '\r') {
       write(2, "\n", 1);
       break;
     }
 
-    // Ctrl+D: exit on an empty line;
-    // otherwise submit the text already entered.
+    // Ctrl+D: exit on an empty line, otherwise submit the line.
     if (c == 4) {
       write(2, "\n", 1);
 
@@ -305,7 +397,7 @@ readconsoleline(char *buf, int nbuf)
       break;
     }
 
-    // Backspace: remove the last character.
+    // Backspace.
     if (c == 8 || c == 127) {
       if (len > 0) {
         buf[--len] = '\0';
@@ -323,7 +415,7 @@ readconsoleline(char *buf, int nbuf)
       continue;
     }
 
-    // Tab completion will be added here.
+    // Tab completion.
     if (c == '\t') {
       complete(buf, &len, nbuf);
       continue;
@@ -333,7 +425,7 @@ readconsoleline(char *buf, int nbuf)
     if ((unsigned char)c < 32)
       continue;
 
-    // Append and echo a character only if it fits.
+    // Ordinary character.
     if (len < nbuf - 2) {
       buf[len++] = c;
       buf[len] = '\0';
@@ -341,7 +433,6 @@ readconsoleline(char *buf, int nbuf)
     }
   }
 
-  // Keep the line format expected by the existing shell.
   buf[len++] = '\n';
   buf[len] = '\0';
 
@@ -359,10 +450,8 @@ getcmd(char *buf, int nbuf)
 
   memset(buf, 0, nbuf);
 
-  if (interactive) {
-    write(2, "$ ", 2);
+  if (interactive)
     return readconsoleline(buf, nbuf);
-  }
 
   // Input from a file or pipe keeps the original behavior.
   gets(buf, nbuf);
@@ -371,6 +460,121 @@ getcmd(char *buf, int nbuf)
     return -1;
 
   return 0;
+}
+
+static void
+add_history(char *line)
+{
+  if ((int)strlen(line) >= HISTORY_LINE_SIZE)
+    return;
+
+  if (history_count == HISTORY_SIZE) {
+    // Drop the oldest command and shift the others left.
+    memmove(cmd_history[0], cmd_history[1],
+            (HISTORY_SIZE - 1) * sizeof(cmd_history[0]));
+
+    history_count--;
+    history_first++;
+  }
+
+  strcpy(cmd_history[history_count], line);
+  history_count++;
+}
+
+static void
+show_history(void)
+{
+  for (int i = 0; i < history_count; i++) {
+    printf("%d %s", history_first + i, cmd_history[i]);
+
+    // Stored commands normally already contain a newline.
+    int n = strlen(cmd_history[i]);
+    if (n == 0 || cmd_history[i][n - 1] != '\n')
+      printf("\n");
+  }
+}
+
+// Return 0 on success, -1 on an invalid history request.
+// Ordinary commands are left unchanged.
+static int
+expand_history(char *cmd, int capacity)
+{
+  int number;
+  int last;
+  int i;
+  int digit;
+  int length;
+  char saved[HISTORY_LINE_SIZE];
+
+  if (cmd[0] != '!')
+    return 0;
+
+  if (history_count == 0) {
+    fprintf(2, "sh: history is empty\n");
+    return -1;
+  }
+
+  last = history_first + history_count - 1;
+
+  if (cmd[1] == '!') {
+    // !! means the most recent command.
+    number = last;
+    i = 2;
+  } else {
+    // !n means the command whose displayed number is n.
+    number = 0;
+    i = 1;
+
+    if (cmd[i] < '0' || cmd[i] > '9')
+      goto invalid;
+
+    while (cmd[i] >= '0' && cmd[i] <= '9') {
+      digit = cmd[i] - '0';
+
+      // Reject numbers above last without overflowing int.
+      if (number > last / 10 ||
+          (number == last / 10 && digit > last % 10))
+        goto invalid;
+
+      number = number * 10 + digit;
+      i++;
+    }
+  }
+
+  // This version accepts only !! or !n, with optional trailing spaces.
+  while (cmd[i] == ' ' || cmd[i] == '\t')
+    i++;
+
+  if (cmd[i] == '\n')
+    i++;
+
+  if (cmd[i] != '\0')
+    goto invalid;
+
+  if (number < history_first || number > last)
+    goto invalid;
+
+  // Copy before add_history() can shift or overwrite the history array.
+  strcpy(saved, cmd_history[number - history_first]);
+
+  length = strlen(saved);
+  if (length >= capacity) {
+    fprintf(2, "sh: history command is too long\n");
+    return -1;
+  }
+
+  strcpy(cmd, saved);
+
+  // Show the expanded command before executing it.
+  fprintf(2, "%s", cmd);
+  if (length == 0 || cmd[length - 1] != '\n')
+    fprintf(2, "\n");
+
+  return 0;
+
+invalid:
+  fprintf(2, "sh: invalid or unavailable history number\n");
+  return -1;
 }
 
 int
@@ -394,6 +598,21 @@ main(void)
       cmd++;
     if (*cmd == '\n') // is a blank command
       continue;
+
+    // Expand before saving the command into history.
+    if (expand_history(cmd, sizeof(buf) - (cmd - buf)) < 0)
+      continue;
+
+    // Save the command before executing it.
+    add_history(cmd);
+
+    // Handle history in the shell itself.
+    if (strcmp(cmd, "history\n") == 0 ||
+        strcmp(cmd, "history") == 0) {
+      show_history();
+      continue;
+    }
+
     if (cmd[0] == 'c' && cmd[1] == 'd' && cmd[2] == ' ') {
       // Chdir must be called by the parent, not the child.
       cmd[strlen(cmd) - 1] = 0; // chop \n

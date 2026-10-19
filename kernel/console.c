@@ -67,6 +67,12 @@ consolemode(int enabled)
 
   acquire(&cons.lock);
 
+  // Already in normal mode: do not modify the input buffer.
+  if (enabled == 0 && cons.rawpid == 0) {
+    release(&cons.lock);
+    return 0;
+  }
+
   // Another process currently owns raw mode.
   if (cons.rawpid != 0 && cons.rawpid != pid) {
     release(&cons.lock);
