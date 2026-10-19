@@ -4,6 +4,7 @@
 #include "user/user.h"
 #include "kernel/fcntl.h"
 #include "kernel/stat.h"
+#include "kernel/fs.h"
 
 // Parsed command representation
 #define EXEC  1
@@ -132,16 +133,243 @@ runcmd(struct cmd *cmd)
   exit(0);
 }
 
+// Find the next directory entry whose name starts with prefix.
+// name must have room for DIRSIZ + 1 bytes.
+static int
+nextmatch(int fd, char *prefix, int plen, char *name)
+{
+  struct dirent de;
+
+  while (read(fd, &de, sizeof(de)) == sizeof(de)) {
+    // An unused directory entry.
+    if (de.inum == 0)
+      continue;
+
+    // Directory-entry names may not end with '\0'.
+    memmove(name, de.name, DIRSIZ);
+    name[DIRSIZ] = '\0';
+
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+      continue;
+
+    if ((int)strlen(name) < plen)
+      continue;
+
+    if (memcmp(name, prefix, plen) == 0)
+      return 1;
+  }
+
+  return 0;
+}
+
+static void
+complete(char *buf, int *len, int capacity)
+{
+  int start = *len;
+  int first_word = 1;
+  int fd;
+  int count = 0;
+  int plen;
+  int oldlen;
+  int extra;
+  char *dir;
+  char name[DIRSIZ + 1];
+  char only[DIRSIZ + 1];
+  struct stat st;
+
+  // Locate the beginning of the word being completed.
+  while (start > 0 &&
+         buf[start - 1] != ' ' &&
+         buf[start - 1] != '\t')
+    start--;
+
+  // Is there another word before this one?
+  for (int i = 0; i < start; i++) {
+    if (buf[i] != ' ' && buf[i] != '\t') {
+      first_word = 0;
+      break;
+    }
+  }
+
+  dir = first_word ? "/" : ".";
+  plen = *len - start;
+
+  fd = open(dir, O_RDONLY);
+  if (fd < 0)
+    return;
+
+  if (fstat(fd, &st) < 0 || st.type != T_DIR) {
+    close(fd);
+    return;
+  }
+
+  // First pass: count matches and remember the first name.
+  while (nextmatch(fd, buf + start, plen, name)) {
+    if (count == 0)
+      strcpy(only, name);
+    count++;
+  }
+
+  close(fd);
+
+  // No matches: leave the line unchanged.
+  if (count == 0)
+    return;
+
+  // One match: append its missing suffix and a space.
+  if (count == 1) {
+    extra = (int)strlen(only) - plen;
+
+    // Reserve room for the space, newline, and '\0'.
+    if (*len + extra + 1 > capacity - 2)
+      return;
+
+    oldlen = *len;
+
+    memmove(buf + *len, only + plen, extra);
+    *len += extra;
+
+    buf[(*len)++] = ' ';
+    buf[*len] = '\0';
+
+    write(2, buf + oldlen, *len - oldlen);
+    return;
+  }
+
+  // Multiple matches: list them without modifying the input line.
+  fd = open(dir, O_RDONLY);
+  if (fd < 0)
+    return;
+
+  write(2, "\n", 1);
+
+  int printed = 0;
+  while (nextmatch(fd, buf + start, plen, name)) {
+    if (printed)
+      write(2, " ", 1);
+
+    write(2, name, strlen(name));
+    printed = 1;
+  }
+
+  close(fd);
+
+  // Redraw the prompt and the line already entered.
+  write(2, "\n$ ", 3);
+  write(2, buf, *len);
+}
+
+// Read and edit a line from the console.
+// Reserve space for a trailing newline and a terminating '\0'.
+int
+readconsoleline(char *buf, int nbuf)
+{
+  int len = 0;
+  int cc;
+  char c;
+
+  if (nbuf < 2)
+    return -1;
+
+  buf[0] = '\0';
+
+  if (consolemode(1) < 0) {
+    fprintf(2, "sh: cannot enable console input mode\n");
+    return -1;
+  }
+
+  for (;;) {
+    cc = read(0, &c, 1);
+
+    if (cc < 1) {
+      consolemode(0);
+      return -1;
+    }
+
+    // Enter: finish the line.
+    if (c == '\n' || c == '\r') {
+      write(2, "\n", 1);
+      break;
+    }
+
+    // Ctrl+D: exit on an empty line;
+    // otherwise submit the text already entered.
+    if (c == 4) {
+      write(2, "\n", 1);
+
+      if (len == 0) {
+        consolemode(0);
+        return -1;
+      }
+
+      break;
+    }
+
+    // Backspace: remove the last character.
+    if (c == 8 || c == 127) {
+      if (len > 0) {
+        buf[--len] = '\0';
+        write(2, "\b \b", 3);
+      }
+      continue;
+    }
+
+    // Ctrl+U: erase the current line.
+    if (c == 21) {
+      while (len > 0) {
+        buf[--len] = '\0';
+        write(2, "\b \b", 3);
+      }
+      continue;
+    }
+
+    // Tab completion will be added here.
+    if (c == '\t') {
+      complete(buf, &len, nbuf);
+      continue;
+    }
+
+    // Ignore other control characters.
+    if ((unsigned char)c < 32)
+      continue;
+
+    // Append and echo a character only if it fits.
+    if (len < nbuf - 2) {
+      buf[len++] = c;
+      buf[len] = '\0';
+      write(2, &c, 1);
+    }
+  }
+
+  // Keep the line format expected by the existing shell.
+  buf[len++] = '\n';
+  buf[len] = '\0';
+
+  consolemode(0);
+  return 0;
+}
+
 int
 getcmd(char *buf, int nbuf)
 {
   struct stat st;
-  if (fstat(0, &st) == 0 && st.type == T_DEVICE)
-    write(2, "$ ", 2);
+  int interactive;
+
+  interactive = fstat(0, &st) == 0 && st.type == T_DEVICE;
+
   memset(buf, 0, nbuf);
+
+  if (interactive) {
+    write(2, "$ ", 2);
+    return readconsoleline(buf, nbuf);
+  }
+
+  // Input from a file or pipe keeps the original behavior.
   gets(buf, nbuf);
-  if (buf[0] == 0) // EOF
+
+  if (buf[0] == 0)
     return -1;
+
   return 0;
 }
 
