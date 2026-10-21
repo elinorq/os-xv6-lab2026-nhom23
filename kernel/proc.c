@@ -327,6 +327,8 @@ kexit(int status)
 {
   struct proc *p = myproc();
 
+  consolemode(0);
+
   if (p == initproc)
     panic("init exiting");
 

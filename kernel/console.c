@@ -53,7 +53,41 @@ struct {
   uint r; // Read index
   uint w; // Write index
   uint e; // Edit index
+
+  int rawpid; // 0: normal mode; otherwise PID of the raw-mode owner.
 } cons;
+
+int
+consolemode(int enabled)
+{
+  int pid = myproc()->pid;
+
+  if (enabled != 0 && enabled != 1)
+    return -1;
+
+  acquire(&cons.lock);
+
+  // Already in normal mode: do not modify the input buffer.
+  if (enabled == 0 && cons.rawpid == 0) {
+    release(&cons.lock);
+    return 0;
+  }
+
+  // Another process currently owns raw mode.
+  if (cons.rawpid != 0 && cons.rawpid != pid) {
+    release(&cons.lock);
+    return -1;
+  }
+
+  cons.rawpid = enabled ? pid : 0;
+
+  // Make any input already buffered available to the reader.
+  cons.w = cons.e;
+  wakeup(&cons.r);
+
+  release(&cons.lock);
+  return 0;
+}
 
 //
 // user write() system calls to the console go here.
@@ -109,7 +143,8 @@ consoleread(int user_dst, uint64 dst, int n)
 
     c = cons.buf[cons.r++ % INPUT_BUF_SIZE];
 
-    if (c == C('D')) { // end-of-file
+    // UPDATE: end-of-file ONLY in normal mode
+    if (c == C('D') && cons.rawpid == 0) { // end-of-file
       if (n < target) {
         // Save ^D for next time, to make sure
         // caller gets a 0-byte result.
@@ -147,6 +182,21 @@ void
 consoleintr(int c)
 {
   acquire(&cons.lock);
+
+  // In raw mode, deliver each key immediately.
+  // Keep Ctrl+P available as the kernel's process-list shortcut.
+  if (cons.rawpid != 0 && c != C('P')) {
+    if (c != 0 && cons.e - cons.r < INPUT_BUF_SIZE) {
+      c = (c == '\r') ? '\n' : c;
+
+      cons.buf[cons.e++ % INPUT_BUF_SIZE] = c;
+      cons.w = cons.e;
+      wakeup(&cons.r);
+    }
+
+    release(&cons.lock);
+    return;
+  }
 
   switch (c) {
   case C('P'): // Print process list.
