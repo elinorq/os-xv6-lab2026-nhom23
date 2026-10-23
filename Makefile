@@ -189,6 +189,7 @@ UPROGS=\
 	$U/_grep\
 	$U/_init\
 	$U/_kill\
+	$U/_killinit\
 	$U/_ln\
 	$U/_ls\
 	$U/_mkdir\
@@ -203,7 +204,6 @@ UPROGS=\
 	$U/_forphan\
 	$U/_dorphan\
 	$U/_sync\
-
 
 
 
