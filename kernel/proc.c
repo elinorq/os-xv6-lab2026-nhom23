@@ -608,6 +608,10 @@ kkill(int pid)
   for (p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if (p->pid == pid) {
+      if (p == initproc) {
+        release(&p->lock);
+        return -1;
+      }
       p->killed = 1;
       if (p->state == SLEEPING) {
         // Wake process from sleep().
